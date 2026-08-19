@@ -3,8 +3,9 @@ use std::{
     io::Write,
     os::fd::RawFd,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -15,6 +16,11 @@ use super::{
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
+/// Upper bound for a clipboard helper (`wl-copy`, `wl-paste`, `xclip`, `xsel`)
+/// before it is killed. On GNOME Wayland, wl-clipboard can block forever waiting
+/// for the compositor to focus its helper surface; these commands run on the
+/// client's input thread, so an unbounded wait freezes the whole UI.
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessDetectionMode {
@@ -562,6 +568,41 @@ fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
     Ok(status.success())
 }
 
+/// Wait for `child` up to `timeout`. On timeout the child is killed and reaped and
+/// `None` is returned so the caller falls back instead of blocking input.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Read `reader` to completion on a helper thread while waiting for `child` with a
+/// timeout. Killing the child on timeout closes the pipe, so the reader thread ends.
+fn read_child_output_with_timeout<R: std::io::Read + Send + 'static>(
+    child: &mut Child,
+    reader: R,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Option<(std::io::Result<LimitedRead>, ExitStatus)> {
+    let handle = std::thread::spawn(move || read_limited_reader(reader, max_bytes));
+    let status = wait_with_timeout(child, timeout);
+    let read = handle.join().ok()?;
+    let status = status?;
+    Some((read, status))
+}
+
 fn read_clipboard_image_with_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new(program);
     command.args(args);
@@ -587,22 +628,14 @@ fn read_clipboard_image_with_spawned_command_max(
         .ok()?;
     let stdout = child.stdout.take()?;
 
-    let read = match read_limited_reader(stdout, max_bytes) {
-        Ok(read) => read,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-    };
+    let (read, status) =
+        read_child_output_with_timeout(&mut child, stdout, max_bytes, CLIPBOARD_COMMAND_TIMEOUT)?;
+    let read = read.ok()?;
 
     if read == LimitedRead::Oversized {
-        let _ = child.kill();
-        let _ = child.wait();
         return None;
     }
 
-    let status = child.wait().ok()?;
     if !status.success() {
         return None;
     }
@@ -677,21 +710,17 @@ fn read_clipboard_text_with_command(command: &ClipboardCommand) -> Option<String
         .ok()?;
 
     let stdout = child.stdout.take()?;
-    let read = match read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES) {
-        Ok(LimitedRead::Oversized) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+    let (read, status) = read_child_output_with_timeout(
+        &mut child,
+        stdout,
+        MAX_CLIPBOARD_TEXT_BYTES,
+        CLIPBOARD_COMMAND_TIMEOUT,
+    )?;
+    let read = match read {
+        Ok(LimitedRead::Oversized) | Err(_) => return None,
         Ok(read) => read,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
     };
 
-    let status = child.wait().ok()?;
     if !status.success() {
         return None;
     }
@@ -728,7 +757,9 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     }
     drop(stdin);
 
-    child.wait().map(|status| status.success()).unwrap_or(false)
+    wait_with_timeout(&mut child, CLIPBOARD_COMMAND_TIMEOUT)
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -1050,6 +1081,30 @@ mod tests {
         };
 
         assert_eq!(read_clipboard_text_with_command(&command), None);
+    }
+
+    #[test]
+    fn run_clipboard_command_gives_up_on_a_helper_that_never_exits() {
+        let command = ClipboardCommand {
+            program: "sh",
+            args: &["-c", "cat >/dev/null; sleep 30"],
+        };
+
+        let started = Instant::now();
+        assert!(!run_clipboard_command(&command, b"text"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn read_clipboard_text_with_command_gives_up_on_a_helper_that_never_exits() {
+        let command = ClipboardCommand {
+            program: "sh",
+            args: &["-c", "sleep 30"],
+        };
+
+        let started = Instant::now();
+        assert_eq!(read_clipboard_text_with_command(&command), None);
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
