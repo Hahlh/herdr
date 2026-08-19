@@ -4,7 +4,10 @@ use std::{
     os::fd::RawFd,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -16,11 +19,30 @@ use super::{
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
-/// Upper bound for a clipboard helper (`wl-copy`, `wl-paste`, `xclip`, `xsel`)
-/// before it is killed. On GNOME Wayland, wl-clipboard can block forever waiting
-/// for the compositor to focus its helper surface; these commands run on the
-/// client's input thread, so an unbounded wait freezes the whole UI.
+/// How long a clipboard helper (`wl-copy`, `wl-paste`, `xclip`, `xsel`) may make
+/// no progress before it is killed. On GNOME Wayland, wl-clipboard can block
+/// forever waiting for the compositor to focus its helper surface; these
+/// commands run on the client's input thread, so an unbounded wait freezes the
+/// whole UI. Reads treat received bytes as progress, so a slow transfer of a
+/// large image is not cut off as long as data keeps arriving.
 const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Byte counter bumped by [`CountingReader`] so a stalled transfer can be told
+/// apart from a slow one.
+type ProgressCounter = Arc<AtomicUsize>;
+
+struct CountingReader<R> {
+    inner: R,
+    progress: ProgressCounter,
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.progress.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessDetectionMode {
@@ -568,14 +590,29 @@ fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
     Ok(status.success())
 }
 
-/// Wait for `child` up to `timeout`. On timeout the child is killed and reaped and
-/// `None` is returned so the caller falls back instead of blocking input.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + timeout;
+/// Wait for `child`, killing and reaping it once `stall_timeout` passes without
+/// progress. `progress` is the running byte count from a [`CountingReader`] when
+/// the caller reads the child's output; for pure waits it never changes, making
+/// this a plain timeout. Returns `None` when the child was killed, so the caller
+/// falls back instead of blocking input.
+fn wait_with_stall_timeout(
+    child: &mut Child,
+    stall_timeout: Duration,
+    progress: Option<&ProgressCounter>,
+) -> Option<ExitStatus> {
+    let mut last_progress = progress.map_or(0, |counter| counter.load(Ordering::Relaxed));
+    let mut deadline = Instant::now() + stall_timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
             Ok(None) => {
+                if let Some(counter) = progress {
+                    let seen = counter.load(Ordering::Relaxed);
+                    if seen != last_progress {
+                        last_progress = seen;
+                        deadline = Instant::now() + stall_timeout;
+                    }
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -589,15 +626,22 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus>
 }
 
 /// Read `reader` to completion on a helper thread while waiting for `child` with a
-/// timeout. Killing the child on timeout closes the pipe, so the reader thread ends.
+/// stall timeout: bytes arriving count as progress, so a slow large transfer is
+/// not cut off, while a helper stuck before producing anything is. Killing the
+/// child on timeout closes the pipe, so the reader thread ends.
 fn read_child_output_with_timeout<R: std::io::Read + Send + 'static>(
     child: &mut Child,
     reader: R,
     max_bytes: usize,
-    timeout: Duration,
+    stall_timeout: Duration,
 ) -> Option<(std::io::Result<LimitedRead>, ExitStatus)> {
+    let progress = ProgressCounter::default();
+    let reader = CountingReader {
+        inner: reader,
+        progress: Arc::clone(&progress),
+    };
     let handle = std::thread::spawn(move || read_limited_reader(reader, max_bytes));
-    let status = wait_with_timeout(child, timeout);
+    let status = wait_with_stall_timeout(child, stall_timeout, Some(&progress));
     let read = handle.join().ok()?;
     let status = status?;
     Some((read, status))
@@ -757,7 +801,7 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     }
     drop(stdin);
 
-    wait_with_timeout(&mut child, CLIPBOARD_COMMAND_TIMEOUT)
+    wait_with_stall_timeout(&mut child, CLIPBOARD_COMMAND_TIMEOUT, None)
         .map(|status| status.success())
         .unwrap_or(false)
 }
@@ -1105,6 +1149,33 @@ mod tests {
         let started = Instant::now();
         assert_eq!(read_clipboard_text_with_command(&command), None);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn read_child_output_with_timeout_survives_a_slow_but_flowing_transfer() {
+        // Emits a byte every 0.4s for 4s total: slower than the 3s stall
+        // timeout end-to-end, but never stalled longer than 0.4s.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("for i in $(seq 10); do printf x; sleep 0.4; done");
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let stdout = child.stdout.take().expect("stdout");
+
+        let (read, status) = read_child_output_with_timeout(
+            &mut child,
+            stdout,
+            1024,
+            Duration::from_secs(3),
+        )
+        .expect("transfer should not be killed while bytes keep arriving");
+        assert!(status.success());
+        assert_eq!(read.expect("read"), LimitedRead::Complete(b"xxxxxxxxxx".to_vec()));
     }
 
     #[test]
